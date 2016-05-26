@@ -4,6 +4,7 @@ import numpy as np
 from rig.bitfield import BitField
 from rig.geometry import minimise_xyz, to_xyz
 from rig.place_and_route.place.hilbert import hilbert_chip_order
+from rig.place_and_route.routing_tree import RoutingTree
 from rig.routing_table import Routes, RoutingTableEntry
 
 import random
@@ -200,3 +201,44 @@ def read_table_lengths(fp):
         lengths[(x, y)] = n_entries
 
     return lengths
+
+
+def get_pruned_routing_tree(tree, prune):
+    """Get a pruned copy of a routing tree by removing all branches of the tree
+    which lead only to specified objects.
+
+    Parameters
+    ----------
+    tree : :py:class:`rig.place_and_route.routing_tree.RoutingTree`
+        The tree to prune, a new copy will be returned.
+    prune : {object, ...}
+        Target objects which should be pruned from the tree.
+
+    Returns
+    -------
+    :py:class:`rig.place_and_route.routing_tree.RoutingTree`
+        A new tree, which is equivalent to the first tree but for having
+        branches which led to objects in `prune` removed.
+    """
+    # Shortcut in the case that there is no pruning necessary
+    if not prune:
+        return tree
+
+    # Construct the new children for the Node
+    children = set()
+
+    for child_direction, child in tree.children:
+        if isinstance(child, RoutingTree):
+            # If the child is a further tree then prune it before adding.
+            subtree = get_pruned_routing_tree(child, prune)
+
+            if subtree.children:
+                # Keep the subtree if it still has children
+                children.add((child_direction, subtree))
+        elif child not in prune:
+            # Otherwise just add the child if it's not in the list of objects
+            # to ignore.
+            children.add((child_direction, child))
+
+    # Return the new routing tree
+    return RoutingTree(tree.chip, children)

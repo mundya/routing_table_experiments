@@ -12,9 +12,19 @@ from rig.netlist import Net
 from rig.place_and_route import Cores, Machine, route
 from rig.routing_table import routing_tree_to_tables
 
-from six import iterkeys
+from six import iterkeys, iteritems
 
 logger = logging.getLogger(__name__)
+
+
+def get_targets(x, y, probs, width, height, rng, vertices):
+    # Get the target co-ordinates
+    xs, ys, ps = np.where(rng.uniform(0, 1, size=probs.shape) < probs)
+    xs = (xs + x) % machine.width
+    ys = (ys + y) % machine.height
+
+    # Get the sinks
+    return list(vertices[xyp] for xyp in zip(xs, ys, ps))
 
 
 def get_network(machine, rng):
@@ -29,6 +39,7 @@ def get_network(machine, rng):
 
     # Compute the probability of a target for each distance
     probs = 0.475**(dists + 1)
+    centroid_probs = 0.25**(dists + 1)
 
     # Create the vertices for each core (and allocations and placements)
     vertices = OrderedDict()
@@ -46,28 +57,50 @@ def get_network(machine, rng):
             placements[vx] = (x, y)
             allocations[vx] = {Cores: slice(p, p+1)}
 
+    # Keep track of targets which are the result of centroid(s)
+    centroid_sinks = defaultdict(lambda: set())
+
     # Now construct the nets
     nets = list()
     for x, y, p in ((i, j, k) for k in range(17) for i, j in machine):
-        # Get the target co-ordinates
-        xs, ys, ps = np.where(rng.uniform(0, 1, size=probs.shape) < probs)
-        xs = (xs + x) % machine.width
-        ys = (ys + y) % machine.height
-
         # Get the source
         source = vertices[x, y, p]
 
-        # Get the sinks
-        sinks = list(vertices[xyp] for xyp in zip(xs, ys, ps))
+        # Get the (local) sinks
+        sinks = get_targets(x, y, probs, machine.width, machine.height,
+                            rng, vertices)
+
+        # Add centroid links if we have any (we have a 5% chance of connecting
+        # to 1 centroid)
+        if rng.uniform(0, 1) < 0.05:
+            # Get the target co-ordinates
+            c_sinks = get_targets(x, y, centroid_probs, machine.width,
+                                  machine.height, rng, vertices)
+
+            # Mark these as sinks relating to a centroid
+            centroid_sinks[x, y, p].update(c_sinks)
+
+            # Add to the general list of sinks
+            sinks += c_sinks
 
         # Add the net
         nets.append(Net(source, sinks))
 
     # Route the nets
     logger.info("Routing...")
-    routes = route(resources, nets, machine, list(), placements, allocations)
 
-    return routes
+    # Get the centroid routes
+    centroid_routes = route(resources, nets, machine, list(),
+                            placements, allocations)
+
+    # Prune back to get the local-only connections
+    logger.info("Pruning...")
+    local_routes = {
+        net: common.get_pruned_routing_tree(tree, centroid_sinks[net.source])
+        for net, tree in iteritems(centroid_routes)
+    }
+
+    return centroid_routes, local_routes
 
 
 if __name__ == "__main__":
@@ -79,7 +112,7 @@ if __name__ == "__main__":
     # Build the network
     logger.info("Building netlist...")
     rng = np.random.RandomState(seed=2804)
-    routes = get_network(machine, rng)
+    centroid_routes, local_routes = get_network(machine, rng)
 
     # Find the necessary number of random bits
     rnd_bits = int(np.ceil(np.log2(machine.width * machine.height * 17)))
@@ -94,15 +127,17 @@ if __name__ == "__main__":
                 (machine, 2804, 21), (machine, 2804, rnd_bits))
     fps = ("xyp", "xyzp", "hilbert", "rnd21", "rnd{:d}".format(rnd_bits))
 
-    for alg, args, fp in zip(algs, all_args, fps):
-        logger.info("Generating keys...")
-        keys = alg(iterkeys(routes), *args)
+    for routes, prefix in ((centroid_routes, "centroid"),
+                           (local_routes, "locally_connected")):
+        for alg, args, fp in zip(algs, all_args, fps):
+            logger.info("Generating keys...")
+            keys = alg(iterkeys(routes), *args)
 
-        # Generate the routing tables
-        logger.info("Building routing tables...")
-        tables = routing_tree_to_tables(routes, keys)
+            # Generate the routing tables
+            logger.info("Building routing tables...")
+            tables = routing_tree_to_tables(routes, keys)
 
-        # Dump to file
-        logger.info("Writing to file...")
-        with open("benchmarks/locally_connected_{}.bin".format(fp), 'wb+') as f:
-            common.dump_routing_tables(f, tables)
+            # Dump to file
+            logger.info("Writing to file...")
+            with open("benchmarks/{}_{}.bin".format(prefix, fp), 'wb+') as f:
+                common.dump_routing_tables(f, tables)
